@@ -5,7 +5,7 @@ on:
     inputs:
       envoy_version:
         description: 'Envoy version (e.g., v1.28.0, or "main" for latest)'
-        default: 'v1.28.0'
+        default: 'main'
         required: true
 
 env:
