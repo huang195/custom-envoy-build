@@ -1,0 +1,68 @@
+name: Build Envoy
+
+on:
+  workflow_dispatch:
+    inputs:
+      envoy_version:
+        description: 'Envoy version (e.g., v1.28.0, or "main" for latest)'
+        default: 'main'
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout Envoy
+      uses: actions/checkout@v4
+      with:
+        repository: envoyproxy/envoy
+        ref: ${{ inputs.envoy_version }}
+        
+    - name: Login to Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Build Envoy
+      run: |
+        ./ci/run_envoy_docker.sh "bazel build --config=libc++ --define=wasm=enabled //source/exe:envoy-static"
+        
+    - name: Create Dockerfile
+      run: |
+        cat > Dockerfile << 'EOF'
+        FROM envoyproxy/envoy:v1.28.0 as base
+        FROM ubuntu:22.04
+        
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            ca-certificates curl libc++1 libc++abi1 && \
+            rm -rf /var/lib/apt/lists/*
+            
+        COPY bazel-bin/source/exe/envoy-static /usr/local/bin/envoy
+        COPY --from=base /docker-entrypoint.sh /docker-entrypoint.sh
+        
+        RUN chmod +x /usr/local/bin/envoy /docker-entrypoint.sh && \
+            groupadd --gid 101 envoy && \
+            useradd --uid 101 --gid envoy --shell /bin/false envoy
+            
+        EXPOSE 10000 9901
+        USER envoy
+        ENTRYPOINT ["/docker-entrypoint.sh"]
+        CMD ["envoy", "--version"]
+        EOF
+        
+    - name: Build and Push Image
+      run: |
+        docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        echo "✅ Image pushed: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
