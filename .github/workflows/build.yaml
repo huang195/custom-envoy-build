@@ -7,33 +7,14 @@ on:
         description: 'Envoy version (e.g., v1.28.0, or "main" for latest)'
         default: 'v1.28.0'
         required: true
-      architecture:
-        description: 'Target architecture'
-        type: choice
-        options:
-        - 'amd64'
-        - 'arm64'
-        - 'both'
-        default: 'amd64'
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-amd64:
-    if: ${{ inputs.architecture == 'amd64' || inputs.architecture == 'both' }}
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    permissions:
-      contents: read
-      packages: write
-    steps:
-    # ... existing steps for AMD64 build
-    
-  build-arm64:
-    if: ${{ inputs.architecture == 'arm64' || inputs.architecture == 'both' }}
-    runs-on: ubuntu-latest-arm64  # ARM64 runners
     timeout-minutes: 120
     permissions:
       contents: read
