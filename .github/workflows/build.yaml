@@ -5,17 +5,36 @@ on:
     inputs:
       envoy_version:
         description: 'Envoy version (e.g., v1.28.0, or "main" for latest)'
-        default: 'main'
+        default: 'v1.28.0'
         required: true
+      architecture:
+        description: 'Target architecture'
+        type: choice
+        options:
+        - 'amd64'
+        - 'arm64'
+        - 'both'
+        default: 'amd64'
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  build-amd64:
+    if: ${{ inputs.architecture == 'amd64' || inputs.architecture == 'both' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    # ... existing steps for AMD64 build
+    
+  build-arm64:
+    if: ${{ inputs.architecture == 'arm64' || inputs.architecture == 'both' }}
+    runs-on: ubuntu-latest-arm64  # ARM64 runners
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -27,6 +46,159 @@ jobs:
         repository: envoyproxy/envoy
         ref: ${{ inputs.envoy_version }}
         
+    - name: Install Build Dependencies
+      run: |
+        echo "📦 Installing build dependencies..."
+        
+        # Update package lists
+        sudo apt-get update
+        
+        # Install essential build tools
+        sudo apt-get install -y \
+          build-essential \
+          curl \
+          git \
+          python3 \
+          python3-pip \
+          python3-dev \
+          libc++-dev \
+          libc++abi-dev \
+          unzip \
+          zip \
+          wget \
+          pkg-config \
+          autoconf \
+          automake \
+          libtool \
+          cmake \
+          ninja-build
+        
+        # Install Bazelisk (manages Bazel versions automatically)
+        curl -Lo bazelisk https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+        chmod +x bazelisk
+        sudo mv bazelisk /usr/local/bin/bazel
+        
+        # Verify installation
+        bazel version
+        python3 --version
+        gcc --version
+        
+    - name: Setup Build Environment
+      run: |
+        echo "🔧 Setting up build environment..."
+        
+        # Increase file descriptor limits
+        ulimit -n 65536
+        
+        # Set environment variables
+        echo "CC=clang" >> $GITHUB_ENV
+        echo "CXX=clang++" >> $GITHUB_ENV
+        echo "BAZEL_CXXOPTS=-stdlib=libc++" >> $GITHUB_ENV
+        
+        # Install Clang if not available
+        sudo apt-get install -y clang-14 lld-14
+        sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 100
+        sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-14 100
+        
+        # Verify compilers
+        clang --version
+        clang++ --version
+        
+    - name: Configure Bazel Build
+      run: |
+        echo "⚙️ Configuring Bazel build..."
+        
+        # Create build configuration
+        cat > .bazelrc.local << 'EOF'
+        # Core features
+        build --define=wasm=enabled
+        build --compilation_mode=opt
+        build --config=libc++
+        
+        # Disable problematic features for GitHub Actions
+        build --define=hot_restart=disabled
+        build --define=liburing=disabled
+        build --define=tcmalloc=disabled
+        build --define=gperftools=disabled
+        
+        # Use system compiler
+        build --action_env=CC=clang
+        build --action_env=CXX=clang++
+        
+        # Resource management for GitHub Actions
+        build --local_ram_resources=6144
+        build --local_cpu_resources=2
+        build --jobs=2
+        
+        # Cache configuration
+        build --disk_cache=/tmp/bazel-cache
+        build --repository_cache=/tmp/bazel-repo-cache
+        
+        # Network settings
+        build --experimental_repository_downloader_retries=3
+        build --experimental_scale_timeouts=5.0
+        
+        # Better error reporting
+        build --verbose_failures
+        build --show_timestamps
+        build --announce_rc
+        
+        # Optimization flags
+        build --copt=-O2
+        build --linkopt=-Wl,--strip-all
+        
+        # Platform settings
+        build --host_platform=@envoy//bazel:x64_linux
+        build --platforms=@envoy//bazel:x64_linux
+        EOF
+        
+        # Create cache directories
+        mkdir -p /tmp/bazel-cache
+        mkdir -p /tmp/bazel-repo-cache
+        
+        echo "✅ Build configuration ready"
+        
+    - name: Build Envoy Binary
+      run: |
+        echo "🏗️ Building Envoy binary..."
+        echo "This will take 45-90 minutes..."
+        
+        # Set memory limits
+        export BAZEL_JVM_ARGS="-Xmx4g -Xms1g"
+        
+        # Clean any previous builds
+        bazel clean --expunge
+        
+        # Show build info
+        bazel info
+        
+        # Start the build
+        bazel build \
+          --config=libc++ \
+          --compilation_mode=opt \
+          --define=wasm=enabled \
+          --define=hot_restart=disabled \
+          --define=tcmalloc=disabled \
+          --verbose_failures \
+          --show_timestamps \
+          //source/exe:envoy-static
+        
+        # Verify the binary was created
+        if [ ! -f "bazel-bin/source/exe/envoy-static" ]; then
+          echo "❌ Build failed - binary not found"
+          exit 1
+        fi
+        
+        # Test the binary
+        echo "🧪 Testing built binary..."
+        ./bazel-bin/source/exe/envoy-static --version
+        
+        # Show binary info
+        ls -la bazel-bin/source/exe/envoy-static
+        file bazel-bin/source/exe/envoy-static
+        
+        echo "✅ Envoy binary built successfully!"
+        
     - name: Login to Registry
       uses: docker/login-action@v3
       with:
@@ -34,65 +206,80 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
         
-    - name: Build Envoy
+    - name: Create Container Image
       run: |
-        # Use official Envoy build image directly instead of CI script
-        docker run --rm \
-          -v "$(pwd):/source" \
-          -v "$PWD/build-output:/build" \
-          -w /source \
-          envoyproxy/envoy-build-ubuntu:f4a881a1205e8e6db1a57162faf3df7aed88eae8@sha256:b10346fe2eee41733dbab0e02322c47a538bf3938d093a5daebad9699860b814 \
-          bash -c "
-            # Configure build
-            cat > .bazelrc.local << 'EOF'
-        build --define=wasm=enabled
-        build --compilation_mode=opt
-        build --config=libc++
-        build --define=hot_restart=disabled
-        build --define=liburing=disabled
-        build --disk_cache=/build/bazel-cache
-        build --repository_cache=/build/repo-cache
-        build --verbose_failures
-        EOF
-            
-            # Build Envoy
-            bazel build //source/exe:envoy-static
-            
-            # Copy to output location
-            mkdir -p /build
-            cp bazel-bin/source/exe/envoy-static /build/envoy-static
-            chmod +x /build/envoy-static
-          "
+        echo "🐳 Creating container image..."
         
-        # Move binary to expected location
-        mkdir -p bazel-bin/source/exe
-        cp build-output/envoy-static bazel-bin/source/exe/envoy-static
-        
-    - name: Create Dockerfile
-      run: |
         cat > Dockerfile << 'EOF'
         FROM envoyproxy/envoy:v1.28.0 as base
         FROM ubuntu:22.04
         
+        # Install runtime dependencies
         RUN apt-get update && apt-get install -y --no-install-recommends \
-            ca-certificates curl libc++1 libc++abi1 && \
-            rm -rf /var/lib/apt/lists/*
+            ca-certificates \
+            curl \
+            libc++1 \
+            libc++abi1 \
+            libgcc-s1 \
+            libstdc++6 \
+            && rm -rf /var/lib/apt/lists/*
             
+        # Copy our custom Envoy binary
         COPY bazel-bin/source/exe/envoy-static /usr/local/bin/envoy
+        
+        # Copy entrypoint from base image
         COPY --from=base /docker-entrypoint.sh /docker-entrypoint.sh
         
+        # Set up permissions and user
         RUN chmod +x /usr/local/bin/envoy /docker-entrypoint.sh && \
             groupadd --gid 101 envoy && \
-            useradd --uid 101 --gid envoy --shell /bin/false envoy
+            useradd --uid 101 --gid envoy --shell /bin/false --home-dir /tmp envoy
+        
+        # Add build labels
+        LABEL org.opencontainers.image.source="https://github.com/${{ github.repository }}"
+        LABEL org.opencontainers.image.description="Custom Envoy proxy with WASM support"
+        LABEL custom.envoy.version="${{ inputs.envoy_version }}"
+        LABEL custom.build.method="native-bazel"
+        LABEL custom.build.timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             
         EXPOSE 10000 9901
         USER envoy
+        
         ENTRYPOINT ["/docker-entrypoint.sh"]
         CMD ["envoy", "--version"]
         EOF
         
     - name: Build and Push Image
       run: |
+        echo "🚀 Building and pushing container image..."
+        
+        # Build the image
         docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
+        
+        # Tag with version
+        docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.envoy_version }}
+        
+        # Test the image
+        echo "🧪 Testing image..."
+        docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        
+        # Push to registry
         docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-        echo "✅ Image pushed: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.envoy_version }}
+        
+        echo ""
+        echo "✅ Build completed successfully!"
+        echo "📦 Images:"
+        echo "   - ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        echo "   - ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.envoy_version }}"
+        echo ""
+        echo "🚀 Use with Envoy Gateway:"
+        echo "helm install envoy-gateway envoy-gateway/gateway \\"
+        echo "  --set config.envoyGateway.provider.kubernetes.envoyDeployment.container.image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        
+    - name: Upload Binary Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: envoy-static-${{ inputs.envoy_version }}
+        path: bazel-bin/source/exe/envoy-static
+        retention-days: 30
