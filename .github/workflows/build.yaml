@@ -36,7 +36,37 @@ jobs:
         
     - name: Build Envoy
       run: |
-        ./ci/run_envoy_docker.sh "bazel build --config=libc++ --define=wasm=enabled //source/exe:envoy-static"
+        # Use official Envoy build image directly instead of CI script
+        docker run --rm \
+          -v "$(pwd):/source" \
+          -v "$PWD/build-output:/build" \
+          -w /source \
+          envoyproxy/envoy-build-ubuntu:f4a881a1205e8e6db1a57162faf3df7aed88eae8@sha256:b10346fe2eee41733dbab0e02322c47a538bf3938d093a5daebad9699860b814 \
+          bash -c "
+            # Configure build
+            cat > .bazelrc.local << 'EOF'
+        build --define=wasm=enabled
+        build --compilation_mode=opt
+        build --config=libc++
+        build --define=hot_restart=disabled
+        build --define=liburing=disabled
+        build --disk_cache=/build/bazel-cache
+        build --repository_cache=/build/repo-cache
+        build --verbose_failures
+        EOF
+            
+            # Build Envoy
+            bazel build //source/exe:envoy-static
+            
+            # Copy to output location
+            mkdir -p /build
+            cp bazel-bin/source/exe/envoy-static /build/envoy-static
+            chmod +x /build/envoy-static
+          "
+        
+        # Move binary to expected location
+        mkdir -p bazel-bin/source/exe
+        cp build-output/envoy-static bazel-bin/source/exe/envoy-static
         
     - name: Create Dockerfile
       run: |
